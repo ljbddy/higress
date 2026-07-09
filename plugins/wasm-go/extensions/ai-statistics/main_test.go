@@ -981,3 +981,132 @@ func TestCompleteFlow(t *testing.T) {
 		})
 	})
 }
+
+func TestIsErrorResponse(t *testing.T) {
+	t.Run("error object in body", func(t *testing.T) {
+		body := []byte(`{"error": {"type": "api_error", "message": "Unauthorized"}}`)
+		require.True(t, isErrorResponse(body))
+	})
+
+	t.Run("error object with only code", func(t *testing.T) {
+		body := []byte(`{"error": {"code": "invalid_api_key"}}`)
+		require.True(t, isErrorResponse(body))
+	})
+
+	t.Run("error string in body", func(t *testing.T) {
+		body := []byte(`{"error": "Something went wrong"}`)
+		require.True(t, isErrorResponse(body))
+	})
+
+	t.Run("empty error string is not counted", func(t *testing.T) {
+		body := []byte(`{"error": ""}`)
+		require.False(t, isErrorResponse(body))
+	})
+
+	t.Run("null error is not counted", func(t *testing.T) {
+		body := []byte(`{"error": null}`)
+		require.False(t, isErrorResponse(body))
+	})
+
+	t.Run("no error field in body", func(t *testing.T) {
+		body := []byte(`{"choices": [{"message": {"content": "Hi"}}], "model": "gpt-4"}`)
+		require.False(t, isErrorResponse(body))
+	})
+
+	t.Run("nested error field not at root", func(t *testing.T) {
+		body := []byte(`{"choices": [{"error": "x"}]}`)
+		require.False(t, isErrorResponse(body))
+	})
+}
+
+// Note: The empty-body HTTP status fallback path in isErrorResponse
+// (statusCode >= 400 check when len(body) == 0) is covered by code review.
+// The wasm test framework cannot pass a truly empty body through
+// CallOnHttpResponseBody (returns "error status returned by host: not found"),
+// so integration tests for this path are not feasible.
+
+func TestFailureCountMetric(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		t.Run("error response body increments failure count only", func(t *testing.T) {
+			host, status := test.NewTestHost(basicConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.SetRouteName("api-v1")
+			host.SetClusterName("cluster-1")
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/api/chat"},
+				{":method", "POST"},
+				{"x-mse-consumer", "user1"},
+			})
+
+			requestBody := []byte(`{"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}`)
+			host.CallOnHttpRequestBody(requestBody)
+
+			time.Sleep(10 * time.Millisecond)
+
+			host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "401"},
+				{"content-type", "application/json"},
+			})
+			errorBody := []byte(`{"error": {"type": "authentication_error", "message": "Invalid API key"}}`)
+			host.CallOnHttpResponseBody(errorBody)
+
+			host.CompleteHttp()
+
+			failureMetric := "route.api-v1.upstream.cluster-1.model.gpt-3.5-turbo.consumer.user1.metric.llm_failure_count"
+			failureValue, err := host.GetCounterMetric(failureMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), failureValue)
+
+			durationCountMetric := "route.api-v1.upstream.cluster-1.model.gpt-3.5-turbo.consumer.user1.metric.llm_duration_count"
+			_, err = host.GetCounterMetric(durationCountMetric)
+			require.Error(t, err, "llm_duration_count should not exist for error response without usage")
+		})
+
+		t.Run("success response does not increment failure count", func(t *testing.T) {
+			host, status := test.NewTestHost(basicConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.SetRouteName("api-v1")
+			host.SetClusterName("cluster-1")
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/api/chat"},
+				{":method", "POST"},
+				{"x-mse-consumer", "user1"},
+			})
+
+			requestBody := []byte(`{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}`)
+			host.CallOnHttpRequestBody(requestBody)
+
+			time.Sleep(10 * time.Millisecond)
+
+			host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"content-type", "application/json"},
+			})
+			responseBody := []byte(`{
+				"choices": [{"message": {"content": "Hello!"}}],
+				"usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+				"model": "gpt-4"
+			}`)
+			host.CallOnHttpResponseBody(responseBody)
+
+			host.CompleteHttp()
+
+			failureMetric := "route.api-v1.upstream.cluster-1.model.gpt-4.consumer.user1.metric.llm_failure_count"
+			_, err := host.GetCounterMetric(failureMetric)
+			require.Error(t, err, "llm_failure_count should not exist for successful response")
+
+			durationCountMetric := "route.api-v1.upstream.cluster-1.model.gpt-4.consumer.user1.metric.llm_duration_count"
+			durationCountValue, err := host.GetCounterMetric(durationCountMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), durationCountValue)
+		})
+	})
+}
